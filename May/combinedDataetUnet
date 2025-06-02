@@ -1,0 +1,696 @@
+import os
+import glob
+import torch
+import nrrd
+import nibabel as nib
+import scipy.ndimage
+import numpy as np
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import re
+import matplotlib.pyplot as plt
+import copy  # For safely copying headers
+import time  # For tracking training time
+from contextlib import nullcontext  # For no-op context on CPU
+import torchio as tio
+from skimage.exposure import equalize_adapthist # For CLAHE
+from skimage.measure import label as skimage_label # For Connected Component Analysis
+
+# --- Configuration ---
+# INPUT_SHAPE is expected to be (H, W, D_model) for initial processing steps
+# e.g., (128, 128, 64) means Height=128, Width=128, Depth_model=64
+INPUT_SHAPE = (128, 128, 64)
+BATCH_SIZE = 2
+EPOCHS = 1000                   # Number of training epochs (adjust as needed)
+LEARNING_RATE = 1e-4
+NUM_CLASSES = 4                 # (class 0 = background, classes 1..3 = foreground)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEBUG = False                   # Set to True for debug prints/visualizations
+
+# Filtering parameters
+APPLY_CLAHE_PREPROCESSING = True # Master switch for CLAHE
+CLAHE_CLIP_LIMIT = 0.01
+APPLY_CCA_POSTPROCESSING = True # Master switch for CCA
+MIN_CONNECTED_COMPONENT_SIZE = 50 # Min voxel count for a component to be kept (for foreground classes)
+VERSION_SUFFIX = "SingleSource_NoHistStd_Robust_v4_FullScript"
+if torch.cuda.is_available():
+    print("✅ CUDA is available! Code will run on GPU.")
+    print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+else:
+    print("❌ CUDA is not available. Code will run on CPU.")
+
+print("[NOTEBOOK_LOG] Starting directory configuration (corrected paths)...")
+RAW_DATA_PARENT_DIR = "/home/isu.femilda/hpc_project/CombinedAltLocalCropped" # MODIFY AS NEEDED
+
+RAW_TRAIN_DIR = os.path.join(RAW_DATA_PARENT_DIR, "train")
+VAL_DIR = os.path.join(RAW_DATA_PARENT_DIR, "val")
+TEST_DIR = os.path.join(RAW_DATA_PARENT_DIR, "test")
+
+PROCESSED_DATA_PARENT_DIR = os.path.join(RAW_DATA_PARENT_DIR, f"ProcessedData_{VERSION_SUFFIX}")
+CACHED_TRAIN_DIR = os.path.join(PROCESSED_DATA_PARENT_DIR, "Train_cached")
+CACHED_VAL_DIR = os.path.join(PROCESSED_DATA_PARENT_DIR, "Val_cached")
+CACHED_TEST_DIR = os.path.join(PROCESSED_DATA_PARENT_DIR, "Test_cached")
+
+OUTPUT_MASK_PATH = os.path.join(RAW_DATA_PARENT_DIR, f"predictions_AttentionUNet_{VERSION_SUFFIX}") # Changed to be relative to PARENT_DIR for common output location
+
+
+print(f"[NOTEBOOK_LOG] RAW_DATA_PARENT_DIR set to: {RAW_DATA_PARENT_DIR}")
+print(f"[NOTEBOOK_LOG] PROCESSED_DATA_PARENT_DIR (where cached data goes) set to: {PROCESSED_DATA_PARENT_DIR}")
+print(f"[NOTEBOOK_LOG] OUTPUT_MASK_PATH (where predictions and models go) set to: {OUTPUT_MASK_PATH}")
+
+os.makedirs(OUTPUT_MASK_PATH, exist_ok=True)
+os.makedirs(PROCESSED_DATA_PARENT_DIR, exist_ok=True)
+os.makedirs(CACHED_TRAIN_DIR, exist_ok=True)
+os.makedirs(CACHED_VAL_DIR, exist_ok=True)
+os.makedirs(CACHED_TEST_DIR, exist_ok=True)
+print("[NOTEBOOK_LOG] Ensured all PROCESSED, CACHED, and OUTPUT data parent directories exist.")
+print("[NOTEBOOK_LOG] Directory configuration complete.")
+
+# --- Utility Functions for Raw Data ---
+def load_medical_image(file_path):
+    """Loads NRRD or NIfTI images, returns data as numpy array (X, Y, Z) or (H, W, D) order typically."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == '.gz': # Handle .nii.gz
+        ext = os.path.splitext(os.path.splitext(file_path)[0])[1].lower() + ext
+    
+    if ext in ['.nii', '.nii.gz']:
+        try:
+            img = nib.load(file_path)
+            data = img.get_fdata()
+        except Exception as e:
+            print(f"Error loading NIfTI file {file_path}: {e}")
+            raise
+    elif ext == '.nrrd':
+        try:
+            data, _ = nrrd.read(file_path) # pynrrd loads data typically as (depth, height, width) if index_order='F'
+                                          # or (width, height, depth) if index_order='C' depending on file
+                                          # For consistency, let's assume it gives (X,Y,Z) like nibabel
+        except Exception as e:
+            print(f"Error loading NRRD file {file_path}: {e}")
+            raise
+    else:
+        raise ValueError(f"Unsupported file format: {file_path} (extension: {ext})")
+    return np.array(data)
+
+def apply_clahe_slice_wise(img_3d_hwd, clip_limit=0.01, kernel_size_divisor=8):
+    """
+    Applies CLAHE slice by slice on the last dimension (assumed Depth).
+    Input img_3d_hwd is (H, W, D) and normalized to [0,1].
+    Output is (H, W, D).
+    """
+    if not APPLY_CLAHE_PREPROCESSING:
+        return img_3d_hwd
+        
+    img_clahe = np.zeros_like(img_3d_hwd)
+    H, W, D_slices = img_3d_hwd.shape
+
+    dim1_ks = max(1, (H // kernel_size_divisor) if (H // kernel_size_divisor) % 2 != 0 else (H // kernel_size_divisor) -1 )
+    dim2_ks = max(1, (W // kernel_size_divisor) if (W // kernel_size_divisor) % 2 != 0 else (W // kernel_size_divisor) -1 )
+    
+    if H < kernel_size_divisor: dim1_ks = H if H % 2 != 0 else max(1, H-1)
+    if W < kernel_size_divisor: dim2_ks = W if W % 2 != 0 else max(1, W-1)
+
+    kernel_size_actual = (dim1_ks, dim2_ks)
+    if kernel_size_actual[0] == 0 or kernel_size_actual[1] == 0:
+        if DEBUG: print(f"CLAHE kernel size is zero for shape {img_3d_hwd.shape[:2]}, skipping CLAHE.")
+        return img_3d_hwd
+
+    for i in range(D_slices):
+        slice_2d = img_3d_hwd[:, :, i]
+        slice_2d_contiguous = np.ascontiguousarray(slice_2d)
+        try:
+            slice_clahe = equalize_adapthist(slice_2d_contiguous, kernel_size=kernel_size_actual, clip_limit=clip_limit)
+            img_clahe[:, :, i] = slice_clahe
+        except Exception as e:
+            if DEBUG: print(f"Error applying CLAHE to slice {i} with kernel {kernel_size_actual}: {e}. Returning original slice.")
+            img_clahe[:, :, i] = slice_2d_contiguous
+    return img_clahe
+
+def preprocess_image(img_xyz, target_shape_hwd=INPUT_SHAPE, order=1):
+    """
+    Preprocesses an image: normalizes, applies CLAHE (optional), and resizes.
+    Input img_xyz is (X,Y,Z) or (orig_H, orig_W, orig_D).
+    target_shape_hwd is (H_model, W_model, D_model).
+    Output is (H_model, W_model, D_model).
+    """
+    img_min = img_xyz.min()
+    img_max = img_xyz.max()
+    if img_max - img_min < 1e-8:
+        img_normalized = np.zeros_like(img_xyz)
+    else:
+        img_normalized = (img_xyz - img_min) / (img_max - img_min + 1e-8)
+    
+    # Assuming img_normalized is (orig_H, orig_W, orig_D) for CLAHE if applied per D slice.
+    # If load_medical_image gives (X,Y,Z) where Z is depth, then CLAHE is applied correctly.
+    # Let's assume img_normalized has depth as the last dimension for apply_clahe_slice_wise.
+    # If original data is (D,H,W), it would need permutation before CLAHE or CLAHE adapted.
+    # For now, assume img_normalized is (H, W, D_orig) for CLAHE.
+    # This means load_medical_image should consistently return H,W,D or X,Y,Z where Z is depth.
+    # Let's assume img_normalized is (H_orig, W_orig, D_orig)
+    
+    # Resize to (H_model, W_model, D_model)
+    # Scipy.ndimage.zoom expects data and target_shape to have corresponding dimensions.
+    # If img_normalized is (H_orig, W_orig, D_orig) and target_shape_hwd is (H_model, W_model, D_model)
+    zoom_factors = [target_shape_hwd[i] / img_normalized.shape[i] for i in range(3)]
+    img_resized_hwd = scipy.ndimage.zoom(img_normalized, zoom_factors, order=order)
+
+    if APPLY_CLAHE_PREPROCESSING: # Apply CLAHE after resize to target H,W dimensions
+        img_processed_hwd = apply_clahe_slice_wise(img_resized_hwd, clip_limit=CLAHE_CLIP_LIMIT)
+    else:
+        img_processed_hwd = img_resized_hwd
+        
+    return img_processed_hwd
+
+def preprocess_mask(mask_xyz, target_shape_hwd=INPUT_SHAPE, order=0):
+    """
+    Preprocesses a mask: resizes.
+    Input mask_xyz is (X,Y,Z) or (orig_H, orig_W, orig_D).
+    target_shape_hwd is (H_model, W_model, D_model).
+    Output is (H_model, W_model, D_model).
+    """
+    zoom_factors = [target_shape_hwd[i] / mask_xyz.shape[i] for i in range(3)]
+    return scipy.ndimage.zoom(mask_xyz, zoom_factors, order=order).astype(np.int64)
+
+def get_image_mask_pairs(directory):
+    image_files = glob.glob(os.path.join(directory, "images", "*"))
+    mask_files = glob.glob(os.path.join(directory, "masks", "*"))
+    
+    def get_basename(file_path):
+        base = os.path.basename(file_path)
+        base = re.sub(r'[\(\_](SCAN|MASK|Mask|scan|mask)[\)]?(_cropped)?(\.nrrd|\.nii|\.nii\.gz)$', '', base, flags=re.IGNORECASE)
+        base = re.sub(r'(_cropped)?(\.nrrd|\.nii|\.nii\.gz)$', '', base)
+        return base
+
+    image_dict = {get_basename(f): f for f in image_files}
+    mask_dict = {get_basename(f): f for f in mask_files}
+    
+    common_keys = set(image_dict.keys()) & set(mask_dict.keys())
+    images = sorted([image_dict[key] for key in common_keys])
+    masks = sorted([mask_dict[key] for key in common_keys])
+
+    if not images or not masks:
+         print(f"❌ No matching image-mask pairs found in {directory}. Check filenames and paths.")
+    elif len(images) != len(masks):
+        print(f"⚠️ Mismatch in number of found images and masks after matching in {directory}. Images: {len(images)}, Masks: {len(masks)}")
+    else:
+        print(f"🔍 Found {len(images)} image-mask pairs in {directory}")
+    return images, masks
+
+# --- TorchIO Augmentations ---
+# TorchIO expects input tensors in (C, D, H, W) format for 3D operations.
+train_transform = tio.Compose([
+    # Spatial
+    tio.RandomFlip(axes=(0,1,2), flip_probability=0.5), # These axes are relative to (D,H,W)
+    tio.RandomAffine(
+        scales=(0.9,1.1),
+        degrees=15,
+        translation=5,
+    ),
+    tio.RandomElasticDeformation(
+        num_control_points=7,
+        max_displacement=7.5,
+        locked_borders=2,
+    ),
+    # Intensity
+    tio.RandomNoise(std=(0,0.025)),
+    tio.RandomBiasField(coefficients=(0.3,0.6)), 
+    tio.RandomGamma(log_gamma=(-0.3,0.3)),
+    tio.RandomBlur(std=(0, 0.75), p=0.25),
+    tio.RandomSpike(num_spikes=(1,3), intensity=(0.1, 0.3), p=0.25),
+    tio.RandomGhosting(num_ghosts=(2,5), axes=(0,1), intensity=(0.3, 0.7), p=0.25), # axes for ghosting are (D,H,W)
+    
+    tio.ZNormalization(masking_method=tio.ZNormalization.mean),
+    tio.Lambda(lambda x: x.float()),
+])
+
+
+# --- Dataset Classes ---
+class TorchIODataset(Dataset):
+    """
+    Loads preprocessed .npy volumes and applies TorchIO transforms.
+    .npy files are assumed to be saved in (H_model, W_model, D_model) order.
+    """
+    def __init__(self, processed_dir, transform=None, input_shape_hwd=INPUT_SHAPE):
+        self.img_paths  = sorted(glob.glob(os.path.join(processed_dir, "*_img.npy")))
+        self.mask_paths = [p.replace("_img.npy","_mask.npy") for p in self.img_paths]
+        self.transform  = transform
+        self.H, self.W, self.D_model = input_shape_hwd
+
+
+        if not self.img_paths:
+            print(f"⚠️ No preprocessed image .npy files found in {processed_dir}. Training might fail.")
+        if len(self.img_paths) != len(self.mask_paths) or \
+           not all(os.path.exists(p) for p in self.mask_paths if "_img.npy" in p.replace("_mask.npy", "_img.npy")):
+            print(f"⚠️ Mismatch or missing files between images and masks in {processed_dir}.")
+
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        try:
+            # Load as (H_model, W_model, D_model)
+            img_hwd  = np.load(self.img_paths[idx]).astype(np.float32)
+            mask_hwd = np.load(self.mask_paths[idx]).astype(np.int64)
+        except Exception as e:
+            print(f"Error loading .npy files: {self.img_paths[idx]} or {self.mask_paths[idx]}. Error: {e}")
+            dummy_img_tensor = torch.zeros((1, self.D_model, self.H, self.W), dtype=torch.float32) # C,D,H,W
+            dummy_mask_tensor = torch.zeros((self.D_model, self.H, self.W), dtype=torch.long) # D,H,W
+            print("Returning dummy data for this item.")
+            return dummy_img_tensor, dummy_mask_tensor
+
+        # .npy files should be stored with an intensity range suitable for tio.ZNormalization.
+        # Manual [0,1] normalization removed from here.
+
+        # Add channel dim: (1, H_model, W_model, D_model)
+        img_tensor_chwd  = torch.from_numpy(img_hwd[np.newaxis, ...])
+        mask_tensor_chwd = torch.from_numpy(mask_hwd[np.newaxis, ...]).long()
+
+        # Permute to (C, D_model, H_model, W_model) for TorchIO and PyTorch Conv3D
+        img_tensor_cdhw = img_tensor_chwd.permute(0, 3, 1, 2)  # (1, D_model, H_model, W_model)
+        mask_tensor_cdhw = mask_tensor_chwd.permute(0, 3, 1, 2) # (1, D_model, H_model, W_model)
+
+        subject = tio.Subject(
+            image=tio.ScalarImage(tensor=img_tensor_cdhw),
+            mask =tio.LabelMap(tensor=mask_tensor_cdhw),
+        )
+        
+        if self.transform:
+            try:
+                subject = self.transform(subject)
+            except Exception as e:
+                print(f"Error during TorchIO transform for {self.img_paths[idx]}: {e}")
+                # Fallback to untransformed, correctly permuted subject's data
+                return subject.image.data, subject.mask.data.squeeze(0).long() # (C,D,H,W) and (D,H,W)
+
+        # subject.image.data is (C, D, H, W)
+        # subject.mask.data is (C, D, H, W), squeeze to (D, H, W) for loss
+        return subject.image.data, subject.mask.data.squeeze(0).long()
+
+
+class MedicalDataset(Dataset):
+    """
+    Processes raw medical images and masks on-the-fly for validation/testing.
+    Outputs image as (C, D_model, H_model, W_model) and mask as (D_model, H_model, W_model).
+    """
+    def __init__(self, directory, input_shape_hwd=INPUT_SHAPE): # (H_model, W_model, D_model)
+        self.image_paths, self.mask_paths = get_image_mask_pairs(directory)
+        self.target_shape_hwd = input_shape_hwd # (H_model, W_model, D_model)
+        self.H_model, self.W_model, self.D_model = input_shape_hwd
+
+        if not self.image_paths:
+            print(f"⚠️ No image files found for MedicalDataset in {directory}. Validation/Testing might fail.")
+    
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        try:
+            # load_medical_image returns (orig_H, orig_W, orig_D) or (X,Y,Z)
+            img_data_orig_hwd = load_medical_image(self.image_paths[idx])
+            mask_data_orig_hwd = load_medical_image(self.mask_paths[idx])
+        except Exception as e:
+            print(f"Error loading raw files: {self.image_paths[idx]} or {self.mask_paths[idx]}. Error: {e}")
+            dummy_img = torch.zeros((1, self.D_model, self.H_model, self.W_model), dtype=torch.float32)
+            dummy_mask = torch.zeros((self.D_model, self.H_model, self.W_model), dtype=torch.long)
+            return dummy_img, dummy_mask
+
+        # Preprocess image to (H_model, W_model, D_model)
+        img_processed_hwd = preprocess_image(img_data_orig_hwd, target_shape_hwd=self.target_shape_hwd, order=1)
+        # Add channel dim: (1, H_model, W_model, D_model)
+        img_tensor_chwd = torch.tensor(img_processed_hwd, dtype=torch.float32).unsqueeze(0)
+        # Permute to (C, D_model, H_model, W_model)
+        img_tensor_cdhw = img_tensor_chwd.permute(0, 3, 1, 2)
+
+        # Preprocess mask to (H_model, W_model, D_model)
+        mask_processed_hwd = preprocess_mask(mask_data_orig_hwd, target_shape_hwd=self.target_shape_hwd, order=0)
+        # Permute to (D_model, H_model, W_model)
+        mask_processed_dhw = np.transpose(mask_processed_hwd, (2, 0, 1))
+        mask_tensor_dhw = torch.tensor(mask_processed_dhw, dtype=torch.long)
+        
+        return img_tensor_cdhw, mask_tensor_dhw
+
+# --- Model Definition (3D U-Net) ---
+# Expects input (B, C, D, H, W)
+def conv_block(in_channels, out_channels):
+    return nn.Sequential(
+        nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+        nn.BatchNorm3d(out_channels),
+        nn.ReLU(inplace=True),
+        nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+        nn.BatchNorm3d(out_channels),
+        nn.ReLU(inplace=True)
+    )
+
+class UNet3D(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(UNet3D, self).__init__()
+        self.enc1 = conv_block(in_channels, 32)
+        self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2) # Pool D, H, W
+        self.enc2 = conv_block(32, 64)
+        self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)
+        self.enc3 = conv_block(64, 128)
+        self.pool3 = nn.MaxPool3d(kernel_size=2, stride=2)
+        self.bottleneck = conv_block(128, 256)
+        self.up3 = nn.ConvTranspose3d(256, 128, kernel_size=2, stride=2)
+        self.dec3 = conv_block(256, 128) 
+        self.up2 = nn.ConvTranspose3d(128, 64, kernel_size=2, stride=2)
+        self.dec2 = conv_block(128, 64)  
+        self.up1 = nn.ConvTranspose3d(64, 32, kernel_size=2, stride=2)
+        self.dec1 = conv_block(64, 32)   
+        self.out_conv = nn.Conv3d(32, out_channels, kernel_size=1)
+    
+    def forward(self, x): # x is (B, C, D, H, W)
+        enc1 = self.enc1(x)
+        enc2 = self.enc2(self.pool1(enc1))
+        enc3 = self.enc3(self.pool2(enc2))
+        bottleneck = self.bottleneck(self.pool3(enc3))
+        dec3 = self.up3(bottleneck)
+        dec3 = torch.cat((dec3, enc3), dim=1) # Concatenate along channel dim
+        dec3 = self.dec3(dec3)
+        dec2 = self.up2(dec3)
+        dec2 = torch.cat((dec2, enc2), dim=1)
+        dec2 = self.dec2(dec2)
+        dec1 = self.up1(dec2)
+        dec1 = torch.cat((dec1, enc1), dim=1)
+        dec1 = self.dec1(dec1)
+        logits = self.out_conv(dec1) # Output is (B, NumClasses, D, H, W)
+        if DEBUG:
+            print("=== Forward Pass Debug (Shapes: B,C,D,H,W) ===")
+            print(f"Input shape: {x.shape}")
+            print(f"Enc1 shape: {enc1.shape}, Pool1 out: {self.pool1(enc1).shape}")
+            # ... (add more debug prints if needed for D,H,W dimensions)
+            print(f"Logits shape: {logits.shape}")
+            print("==========================")
+        return logits
+
+# --- Focal Tversky Loss ---
+# preds is (B, C, D, H, W), targets is (B, D, H, W)
+class FocalTverskyLoss(nn.Module):
+    def __init__(self, alpha=0.7, beta=0.3, gamma=0.75, smooth=1e-6):
+        super(FocalTverskyLoss, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.smooth = smooth
+    
+    def forward(self, preds, targets): # preds: (B,C,D,H,W), targets: (B,D,H,W)
+        preds_softmax = F.softmax(preds, dim=1) 
+        
+        # One-hot encode targets: (B, D, H, W) -> (B, D, H, W, C) -> (B, C, D, H, W)
+        targets_one_hot = F.one_hot(targets, num_classes=NUM_CLASSES).permute(0, 4, 1, 2, 3).float()
+        
+        dims = (2, 3, 4) # Sum over D, H, W dimensions
+        TP = (preds_softmax * targets_one_hot).sum(dim=dims)
+        FP = (preds_softmax * (1 - targets_one_hot)).sum(dim=dims) 
+        FN = ((1 - preds_softmax) * targets_one_hot).sum(dim=dims)
+        
+        Tversky = (TP + self.smooth) / (TP + self.alpha * FN + self.beta * FP + self.smooth)
+        focal_tversky_loss = (1 - Tversky) ** self.gamma
+        return focal_tversky_loss.mean()
+
+criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
+
+
+# --- Post-processing: Connected Component Analysis ---
+# Operates on a single mask_dhw_np (D, H, W)
+def postprocess_mask_cca(mask_dhw_np, num_classes, min_size_threshold):
+    if not APPLY_CCA_POSTPROCESSING or min_size_threshold <= 0:
+        return mask_dhw_np
+
+    final_mask = np.zeros_like(mask_dhw_np, dtype=mask_dhw_np.dtype)
+    
+    if 0 in np.unique(mask_dhw_np):
+        final_mask[mask_dhw_np == 0] = 0
+
+    for cls_val in range(1, num_classes): 
+        binary_class_mask = (mask_dhw_np == cls_val)
+        if not np.any(binary_class_mask):
+            continue
+
+        labeled_class_mask, num_labels = skimage_label(binary_class_mask, return_num=True, connectivity=mask_dhw_np.ndim)
+        
+        for i in range(1, num_labels + 1): 
+            component = (labeled_class_mask == i)
+            if np.sum(component) >= min_size_threshold:
+                final_mask[component] = cls_val 
+    
+    return final_mask
+
+
+# --- Training and Evaluation ---
+# pred_dhw_np and target_dhw_np are (D,H,W)
+def compute_metrics(pred_dhw_np, target_dhw_np, num_classes=NUM_CLASSES, smooth=1e-6):
+    dice_scores = []
+    jaccard_scores = []
+    per_class_metrics = {}
+
+    for cls in range(num_classes):
+        pred_cls = (pred_dhw_np == cls).astype(np.float32)
+        target_cls = (target_dhw_np == cls).astype(np.float32)
+        
+        intersection = np.sum(pred_cls * target_cls)
+        pred_sum = np.sum(pred_cls)
+        target_sum = np.sum(target_cls)
+        
+        dice = (2 * intersection + smooth) / (pred_sum + target_sum + smooth)
+        # Ensure denominator for Jaccard is not zero if intersection is zero and sums are zero
+        jaccard_denominator = pred_sum + target_sum - intersection + smooth
+        if jaccard_denominator == 0 and intersection == 0 : # Both pred and target are empty for this class
+            jaccard = 1.0 # Or 0.0, depending on convention for empty sets. 1.0 if perfect match of emptiness.
+        elif jaccard_denominator == 0 and intersection !=0: # Should not happen if smooth > 0
+             jaccard = 0.0
+        else:
+            jaccard = (intersection + smooth) / jaccard_denominator
+
+        dice_scores.append(dice)
+        jaccard_scores.append(jaccard)
+        per_class_metrics[f'class_{cls}'] = {'dice': dice, 'jaccard': jaccard}
+        
+    pixel_accuracy = np.mean(pred_dhw_np.flatten() == target_dhw_np.flatten())
+    mean_dice = np.mean(dice_scores) 
+    mean_jaccard = np.mean(jaccard_scores) 
+    
+    return per_class_metrics, mean_dice, mean_jaccard, pixel_accuracy
+
+def main():
+    print("Initializing datasets...")
+    # Pass INPUT_SHAPE (H,W,D_model) to datasets
+    train_dataset = TorchIODataset(CACHED_TRAIN_DIR, transform=train_transform, input_shape_hwd=INPUT_SHAPE)
+    val_dataset = MedicalDataset(VAL_DIR, input_shape_hwd=INPUT_SHAPE)
+    test_dataset = MedicalDataset(TEST_DIR, input_shape_hwd=INPUT_SHAPE)
+    
+    num_workers = 0 if os.name == 'nt' else 2 
+    
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers, pin_memory=True if DEVICE.type == 'cuda' else False) if len(train_dataset) > 0 else None
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers, pin_memory=True if DEVICE.type == 'cuda' else False) if len(val_dataset) > 0 else None
+        
+    model = UNet3D(in_channels=1, out_channels=NUM_CLASSES).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    
+    if train_loader:
+        print(f"\nStarting model training...")
+        print(f"Input shape (H,W,D_model) for preprocessing: {INPUT_SHAPE}")
+        print(f"Model expects input (B, C, D_model, H, W)")
+        print(f"TorchIO Augmentations: {train_transform}")
+        start_time = time.time()
+        scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == 'cuda'))
+        
+        best_val_loss = float('inf')
+        epochs_no_improve = 0
+        patience = 25 
+
+        for epoch in range(EPOCHS):
+            model.train()
+            train_loss_epoch = 0.0
+            # imgs: (B,C,D,H,W), masks: (B,D,H,W)
+            for batch_idx, (imgs, masks) in enumerate(train_loader):
+                imgs, masks = imgs.to(DEVICE), masks.to(DEVICE)
+                optimizer.zero_grad(set_to_none=True)
+                with torch.cuda.amp.autocast(enabled=(DEVICE.type == 'cuda')):
+                    outputs = model(imgs) # outputs: (B,NumClasses,D,H,W)
+                    loss = criterion(outputs, masks)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                train_loss_epoch += loss.item()
+            
+            train_loss_epoch /= (batch_idx + 1) 
+            
+            val_loss_epoch = float('inf')
+            if val_loader :
+                model.eval()
+                val_loss_epoch = 0.0
+                with torch.no_grad():
+                    for batch_idx_val, (imgs_val, masks_val) in enumerate(val_loader):
+                        imgs_val, masks_val = imgs_val.to(DEVICE), masks_val.to(DEVICE)
+                        with torch.cuda.amp.autocast(enabled=(DEVICE.type == 'cuda')):
+                            outputs_val = model(imgs_val)
+                            loss_val = criterion(outputs_val, masks_val)
+                        val_loss_epoch += loss_val.item()
+                val_loss_epoch /= (batch_idx_val + 1)
+                print(f"Epoch {epoch+1}/{EPOCHS} -- Training Loss: {train_loss_epoch:.4f}, Validation Loss: {val_loss_epoch:.4f}")
+
+                if val_loss_epoch < best_val_loss:
+                    best_val_loss = val_loss_epoch
+                    epochs_no_improve = 0
+                    torch.save(model.state_dict(), os.path.join(OUTPUT_MASK_PATH, "best_model.pth"))
+                    print(f"Validation loss improved. Saved best model.")
+                else:
+                    epochs_no_improve += 1
+                
+                if epochs_no_improve >= patience:
+                    print(f"Early stopping triggered after {patience} epochs without improvement.")
+                    break 
+            else: 
+                 print(f"Epoch {epoch+1}/{EPOCHS} -- Training Loss: {train_loss_epoch:.4f} (No validation)")
+
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        hours = int(elapsed_time // 3600)
+        minutes = int((elapsed_time % 3600) // 60)
+        seconds = elapsed_time % 60
+        print(f"\n--- Training Completed ---\nTotal Training Time: {elapsed_time:.2f}s ({hours}h {minutes}m {seconds:.2f}s)")
+        
+        if os.path.exists(os.path.join(OUTPUT_MASK_PATH, "best_model.pth")):
+            print("Loading best model for final evaluation.")
+            model.load_state_dict(torch.load(os.path.join(OUTPUT_MASK_PATH, "best_model.pth")))
+    else: 
+        print("Skipping training as train_loader is not available.")
+        model_path_for_test = os.path.join(OUTPUT_MASK_PATH, "best_model.pth")
+        if os.path.exists(model_path_for_test):
+            print(f"Loading pre-trained model from {model_path_for_test} for testing.")
+            model.load_state_dict(torch.load(model_path_for_test, map_location=DEVICE))
+        else:
+            print(f"No pre-trained model found. Testing will use an uninitialized model.")
+
+    if len(test_dataset) > 0:
+        print("\n--- Evaluating on Test Set ---")
+        print(f"Post-processing with CCA: {APPLY_CCA_POSTPROCESSING}, Min Component Size: {MIN_CONNECTED_COMPONENT_SIZE if APPLY_CCA_POSTPROCESSING else 'N/A'}")
+        model.eval()
+        all_dice_scores, all_jaccard_scores, all_pixel_accuracies = [], [], []
+        all_per_class_metrics_collector = {f'class_{cls}': {'dice': [], 'jaccard': []} for cls in range(NUM_CLASSES)}
+
+        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=num_workers)
+        
+        for i, (imgs_test, masks_test_gt_dhw) in enumerate(test_loader): # masks_test_gt_dhw is (B,D,H,W)
+            imgs_test = imgs_test.to(DEVICE) # (B,C,D,H,W)
+            
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=(DEVICE.type == 'cuda')):
+                    output_logits = model(imgs_test) # (B,NumClasses,D,H,W)
+                probabilities = F.softmax(output_logits, dim=1)
+                predicted_mask_tensor_bdhw = torch.argmax(probabilities, dim=1) # (B,D,H,W)
+            
+            for batch_item_idx in range(predicted_mask_tensor_bdhw.shape[0]):
+                # pred_mask_dhw_np is (D,H,W)
+                pred_mask_dhw_np = predicted_mask_tensor_bdhw[batch_item_idx].cpu().numpy()
+                # gt_mask_dhw_np is (D,H,W)
+                gt_mask_dhw_np = masks_test_gt_dhw[batch_item_idx].cpu().numpy() # No .to(DEVICE) needed if already processed by DataLoader
+
+                if APPLY_CCA_POSTPROCESSING:
+                    pred_mask_dhw_processed_np = postprocess_mask_cca(pred_mask_dhw_np, NUM_CLASSES, MIN_CONNECTED_COMPONENT_SIZE)
+                else:
+                    pred_mask_dhw_processed_np = pred_mask_dhw_np
+
+                per_class_metrics_sample, mean_dice_sample, mean_jaccard_sample, pa_sample = compute_metrics(
+                    pred_mask_dhw_processed_np, gt_mask_dhw_np, NUM_CLASSES
+                )
+                all_dice_scores.append(mean_dice_sample)
+                all_jaccard_scores.append(mean_jaccard_sample)
+                all_pixel_accuracies.append(pa_sample)
+                for cls in range(NUM_CLASSES):
+                    all_per_class_metrics_collector[f'class_{cls}']['dice'].append(per_class_metrics_sample[f'class_{cls}']['dice'])
+                    all_per_class_metrics_collector[f'class_{cls}']['jaccard'].append(per_class_metrics_sample[f'class_{cls}']['jaccard'])
+
+                original_img_path_idx = i * test_loader.batch_size + batch_item_idx
+                if original_img_path_idx < len(test_dataset.image_paths):
+                    original_img_path = test_dataset.image_paths[original_img_path_idx]
+                    original_img_basename = os.path.basename(original_img_path)
+                    
+                    try:
+                        # Load original image to get its native shape (e.g., H_orig, W_orig, D_orig or X,Y,Z)
+                        original_img_data_native_shape = load_medical_image(original_img_path)
+                        original_native_shape = original_img_data_native_shape.shape
+
+                        # pred_mask_dhw_processed_np is (D_model, H_model, W_model)
+                        # We need to resample it to original_native_shape
+                        # The zoom factors should map (D_model,H_model,W_model) to (orig_dim0, orig_dim1, orig_dim2)
+                        # Assuming original_native_shape is (orig_D, orig_H, orig_W) for direct mapping:
+                        # This requires that load_medical_image returns D,H,W or that we permute original_native_shape
+                        # For simplicity, let's assume pred_mask_dhw_processed_np's axes meaning (Depth, Height, Width)
+                        # should be mapped to original_native_shape's axes meaning.
+                        # If original_native_shape is (X,Y,Z), and pred is (D,H,W)
+                        # We want resampled to be (X,Y,Z)
+                        zoom_factors = [original_native_shape[d] / pred_mask_dhw_processed_np.shape[d] for d in range(3)]
+                        resampled_pred_mask_native_shape = scipy.ndimage.zoom(pred_mask_dhw_processed_np, zoom_factors, order=0).astype(np.short)
+
+                        # Determine output filename
+                        base, orig_ext = os.path.splitext(original_img_basename)
+                        if orig_ext.lower() == ".gz": # Handle .nii.gz
+                            base, _ = os.path.splitext(base) 
+                        output_filename_nrrd = os.path.join(OUTPUT_MASK_PATH, f"{base}_pred_filtered.nrrd")
+                        
+                        nrrd_header = None
+                        if original_img_path.lower().endswith(".nrrd"):
+                            try:
+                                _, nrrd_header = nrrd.read(original_img_path)
+                                nrrd_header = copy.deepcopy(nrrd_header) # Make a mutable copy
+                            except Exception as e_nrrd_read:
+                                print(f"Warning: Could not read original NRRD header for {original_img_path}: {e_nrrd_read}")
+                                nrrd_header = None
+                        
+                        if nrrd_header is None: # Create a default header
+                            nrrd_header = {}
+                            nrrd_header['type'] = 'short'
+                            nrrd_header['dimension'] = resampled_pred_mask_native_shape.ndim
+                            nrrd_header['space'] = 'left-posterior-superior' # Common default
+                            nrrd_header['sizes'] = np.array(resampled_pred_mask_native_shape.shape)
+                            # Try to get spacing from NIfTI affine if original was NIfTI
+                            if original_img_path.lower().endswith((".nii", ".nii.gz")):
+                                try:
+                                    nib_img = nib.load(original_img_path)
+                                    spacings = np.abs(np.diag(nib_img.affine)[:3])
+                                    nrrd_header['space directions'] = np.diag(spacings)
+                                except Exception as e_nib_affine:
+                                    print(f"Warning: Could not get spacing from NIfTI {original_img_path}: {e_nib_affine}. Using default.")
+                                    nrrd_header['space directions'] = np.eye(3) # Default 1mm isotropic
+                            else: # Default for NRRD or if NIfTI spacing fails
+                                nrrd_header['space directions'] = np.eye(3)
+                            nrrd_header['endian'] = 'little'
+                            nrrd_header['encoding'] = 'gzip'
+                        else: # Clean existing NRRD header
+                            nrrd_header['type'] = 'short'
+                            nrrd_header['encoding'] = 'gzip' # Ensure gzip for consistency
+                            # Ensure 'sizes' matches the data being written
+                            nrrd_header['sizes'] = np.array(resampled_pred_mask_native_shape.shape)
+                            if 'data file' in nrrd_header: del nrrd_header['data file']
+                            # Optional: Add more robust 'space directions' handling if needed
+                        
+                        nrrd.write(output_filename_nrrd, resampled_pred_mask_native_shape, header=nrrd_header)
+                        print(f"Saved filtered prediction for {original_img_basename} to {output_filename_nrrd}")
+                    
+                    except Exception as e_save:
+                        print(f"Could not save prediction for {original_img_basename} as NRRD. Error: {e_save}")
+                        npy_output_filename = os.path.join(OUTPUT_MASK_PATH, f"{base}_pred_filtered_RESAMPLED.npy")
+                        np.save(npy_output_filename, resampled_pred_mask_native_shape)
+                        print(f"Saved resampled prediction as NPY to {npy_output_filename}")
+
+        print("\n--- Aggregated Test Evaluation Metrics ---")
+        print(f"Mean Dice (overall): {np.mean(all_dice_scores):.4f} ± {np.std(all_dice_scores):.4f}")
+        print(f"Mean IoU (overall): {np.mean(all_jaccard_scores):.4f} ± {np.std(all_jaccard_scores):.4f}")
+        print(f"Mean Pixel Acc (overall): {np.mean(all_pixel_accuracies):.4f} ± {np.std(all_pixel_accuracies):.4f}")
+
+        print("\nPer-Class Test Metrics (Mean ± Std):")
+        for cls in range(NUM_CLASSES):
+            class_dice = all_per_class_metrics_collector[f'class_{cls}']['dice']
+            class_jaccard = all_per_class_metrics_collector[f'class_{cls}']['jaccard']
+            print(f"  Class {cls}: Dice = {np.mean(class_dice):.4f} ± {np.std(class_dice):.4f}, "
+                  f"Jaccard = {np.mean(class_jaccard):.4f} ± {np.std(class_jaccard):.4f}")
+    else:
+        print("Test dataset is empty. Skipping final evaluation.")
+
+if __name__ == "__main__":
+    main()
